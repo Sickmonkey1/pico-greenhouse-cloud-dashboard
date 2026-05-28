@@ -1,15 +1,26 @@
 from flask import Flask, request, jsonify, render_template_string
-from datetime import datetime, timezone
+from datetime import datetime
 from collections import deque
 import os
 import time
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("PICO_API_KEY", "change-this-key")
+# =========================
+# CONFIG
+# =========================
 
-MAX_HISTORY = 300
+API_KEY = os.environ.get("PICO_API_KEY", "change-this-key")
+UPDATE_PIN = os.environ.get("UPDATE_PIN", "1234")
+
+MAX_HISTORY = 1440
 history = deque(maxlen=MAX_HISTORY)
+
+pending_pico_update = {
+    "requested": False,
+    "requested_at": None,
+    "message": "No update pending"
+}
 
 latest_data = {
     "timestamp": "No data yet",
@@ -24,13 +35,22 @@ latest_data = {
 }
 
 
+# =========================
+# HELPERS
+# =========================
+
 def now_string():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def safe_float(value):
     try:
-        return float(value)
+        if value is None:
+            return None
+        value = float(value)
+        if value != value:
+            return None
+        return value
     except:
         return None
 
@@ -44,25 +64,70 @@ def get_min_max(key):
     return min(values), max(values)
 
 
-def get_pressure_trend():
-    if len(history) < 5:
-        return "Collecting pressure trend"
+def recent_values(key, count):
+    values = [item.get(key) for item in list(history)[-count:]]
+    return [v for v in values if v is not None]
 
-    first = history[0].get("pressure")
-    last = history[-1].get("pressure")
 
-    if first is None or last is None:
-        return "Collecting pressure trend"
+def get_change(key, count):
+    values = recent_values(key, count)
 
-    change = last - first
+    if len(values) < 2:
+        return None
 
-    if change <= -2.0:
-        return "Pressure falling - storm/rain possible"
-    elif change >= 2.0:
+    return values[-1] - values[0]
+
+
+def get_weather_prediction():
+    if len(history) < 10:
+        return "Collecting weather trend"
+
+    pressure_30 = get_change("pressure", 30)
+    pressure_60 = get_change("pressure", 60)
+    humidity_30 = get_change("humidity", 30)
+    temp_30 = get_change("temperature", 30)
+
+    latest_pressure = latest_data.get("pressure")
+    latest_humidity = latest_data.get("humidity")
+
+    if latest_pressure is None or latest_humidity is None:
+        return "Collecting weather trend"
+
+    if pressure_30 is None:
+        return "Collecting weather trend"
+
+    # Local backyard-style prediction rules.
+    # These are intentionally more sensitive than normal Bureau-style forecasting.
+    if pressure_30 <= -1.0 and humidity_30 is not None and humidity_30 >= 3:
+        return "Pressure falling + humidity rising - rain/storm possible"
+
+    if pressure_30 <= -1.5:
+        return "Pressure falling quickly - unsettled weather possible"
+
+    if pressure_60 is not None and pressure_60 <= -2.0:
+        return "Pressure falling over the hour - rain possible"
+
+    if pressure_30 >= 1.0 and humidity_30 is not None and humidity_30 <= -2:
+        return "Pressure rising + humidity dropping - clearing/improving"
+
+    if pressure_30 >= 1.5:
         return "Pressure rising - weather improving"
-    else:
-        return "Pressure stable"
 
+    if latest_humidity >= 90:
+        return "Very humid - damp/rainy conditions possible"
+
+    if latest_humidity >= 85:
+        return "Humidity high - moisture in the air"
+
+    if temp_30 is not None and temp_30 <= -1.0 and humidity_30 is not None and humidity_30 >= 2:
+        return "Cooling with humidity rising - rain nearby possible"
+
+    return "Pressure stable"
+
+
+# =========================
+# WEB PAGE
+# =========================
 
 page = """
 <!DOCTYPE html>
@@ -121,21 +186,10 @@ page = """
             box-shadow: 0 18px 40px rgba(40, 60, 90, 0.16);
         }
 
-        .span-4 {
-            grid-column: span 4;
-        }
-
-        .span-6 {
-            grid-column: span 6;
-        }
-
-        .span-8 {
-            grid-column: span 8;
-        }
-
-        .span-12 {
-            grid-column: span 12;
-        }
+        .span-4 { grid-column: span 4; }
+        .span-6 { grid-column: span 6; }
+        .span-8 { grid-column: span 8; }
+        .span-12 { grid-column: span 12; }
 
         .label {
             font-size: 13px;
@@ -188,11 +242,12 @@ page = """
             background: #f4f8ff;
             border-radius: 18px;
             padding: 12px;
+            margin-top: 10px;
         }
 
         canvas {
             width: 100%;
-            height: 170px;
+            height: 220px;
             display: block;
         }
 
@@ -213,6 +268,22 @@ page = """
             font-weight: 700;
         }
 
+        button {
+            cursor: pointer;
+        }
+
+        .update-button {
+            width: 100%;
+            margin-top: 12px;
+            padding: 14px;
+            border: none;
+            border-radius: 18px;
+            background: #111827;
+            color: white;
+            font-weight: 800;
+            font-size: 15px;
+        }
+
         .footer {
             text-align: center;
             color: #6b7280;
@@ -227,6 +298,10 @@ page = """
 
             .big-temp {
                 font-size: 64px;
+            }
+
+            canvas {
+                height: 200px;
             }
         }
     </style>
@@ -311,6 +386,15 @@ page = """
                 <div class="label">Pico Code Version</div>
                 <b id="version">--</b>
             </div>
+
+            <div class="mini-box">
+                <div class="label">Update Status</div>
+                <b id="update_status">No update pending</b>
+            </div>
+
+            <button class="update-button" onclick="requestPicoUpdate()">
+                Update Pico from GitHub
+            </button>
         </div>
 
         <div class="card span-4">
@@ -361,7 +445,20 @@ function fmt(value, decimals = 1) {
     return n.toFixed(decimals);
 }
 
-function drawChart(canvasId, values, label) {
+function formatTime24(timestamp) {
+    if (!timestamp) return "";
+
+    let parts = String(timestamp).split(" ");
+    let timePart = parts.length > 1 ? parts[1] : parts[0];
+
+    if (timePart.length >= 5) {
+        return timePart.substring(0, 5);
+    }
+
+    return timePart;
+}
+
+function drawChart(canvasId, points, key, label, unit, decimals = 1) {
     const canvas = document.getElementById(canvasId);
     const ctx = canvas.getContext("2d");
 
@@ -373,29 +470,60 @@ function drawChart(canvasId, values, label) {
 
     ctx.clearRect(0, 0, width, height);
 
-    ctx.lineWidth = 2;
+    const padLeft = 52;
+    const padRight = 12;
+    const padTop = 28;
+    const padBottom = 34;
+
+    const plotW = width - padLeft - padRight;
+    const plotH = height - padTop - padBottom;
+
+    const clean = points
+        .filter(p => p[key] !== null && p[key] !== undefined && !isNaN(Number(p[key])))
+        .map(p => ({
+            value: Number(p[key]),
+            timestamp: p.timestamp
+        }));
+
     ctx.strokeStyle = "#d1d5db";
+    ctx.lineWidth = 1;
 
     for (let i = 0; i <= 4; i++) {
-        let y = (height / 4) * i;
+        let y = padTop + (plotH / 4) * i;
         ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(width, y);
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(width - padRight, y);
         ctx.stroke();
     }
 
-    const clean = values.filter(v => v !== null && v !== undefined && !isNaN(Number(v))).map(Number);
+    ctx.fillStyle = "#6b7280";
+    ctx.font = "11px Arial";
 
     if (clean.length < 2) {
-        ctx.fillStyle = "#6b7280";
-        ctx.font = "14px Arial";
-        ctx.fillText("Waiting for more data...", 12, 30);
+        ctx.fillText("Waiting for more data...", padLeft, padTop + 20);
         return;
     }
 
-    const min = Math.min(...clean);
-    const max = Math.max(...clean);
+    const values = clean.map(p => p.value);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
     const range = max - min || 1;
+
+    for (let i = 0; i <= 4; i++) {
+        let value = max - (range / 4) * i;
+        let y = padTop + (plotH / 4) * i + 4;
+        ctx.fillText(value.toFixed(decimals), 6, y);
+    }
+
+    const timeLabels = 4;
+
+    for (let i = 0; i <= timeLabels; i++) {
+        let index = Math.round((clean.length - 1) * (i / timeLabels));
+        let x = padLeft + (plotW * i / timeLabels);
+        let t = formatTime24(clean[index].timestamp);
+
+        ctx.fillText(t, x - 14, height - 10);
+    }
 
     ctx.strokeStyle = "#2563eb";
     ctx.lineWidth = 4;
@@ -404,9 +532,9 @@ function drawChart(canvasId, values, label) {
 
     ctx.beginPath();
 
-    clean.forEach((value, index) => {
-        const x = (index / (clean.length - 1)) * width;
-        const y = height - ((value - min) / range) * (height - 20) - 10;
+    clean.forEach((point, index) => {
+        const x = padLeft + (index / (clean.length - 1)) * plotW;
+        const y = padTop + plotH - ((point.value - min) / range) * plotH;
 
         if (index === 0) {
             ctx.moveTo(x, y);
@@ -419,7 +547,32 @@ function drawChart(canvasId, values, label) {
 
     ctx.fillStyle = "#111827";
     ctx.font = "13px Arial";
-    ctx.fillText(label + "  Min: " + min.toFixed(1) + "  Max: " + max.toFixed(1), 12, 18);
+    ctx.fillText(label + "  Min: " + min.toFixed(decimals) + unit + "  Max: " + max.toFixed(decimals) + unit, padLeft, 18);
+}
+
+async function requestPicoUpdate() {
+    const pin = prompt("Enter Pico update PIN:");
+
+    if (!pin) {
+        alert("Update cancelled");
+        return;
+    }
+
+    try {
+        const response = await fetch("/api/request_update", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ pin: pin })
+        });
+
+        const data = await response.json();
+        alert(data.message);
+        loadData();
+    } catch (error) {
+        alert("Update request failed");
+    }
 }
 
 async function loadData() {
@@ -435,6 +588,7 @@ async function loadData() {
         document.getElementById("prediction").innerHTML = data.prediction;
         document.getElementById("last_seen").innerHTML = data.last_seen;
         document.getElementById("version").innerHTML = data.version;
+        document.getElementById("update_status").innerHTML = data.update_status;
 
         document.getElementById("temp_min").innerHTML = fmt(data.stats.temp_min);
         document.getElementById("temp_max").innerHTML = fmt(data.stats.temp_max);
@@ -453,9 +607,9 @@ async function loadData() {
             statusEl.classList.add("warning");
         }
 
-        drawChart("tempChart", data.history.map(x => x.temperature), "Temperature °C");
-        drawChart("humChart", data.history.map(x => x.humidity), "Humidity %");
-        drawChart("pressureChart", data.history.map(x => x.pressure), "Pressure hPa");
+        drawChart("tempChart", data.history, "temperature", "Temperature", "°C", 1);
+        drawChart("humChart", data.history, "humidity", "Humidity", "%", 1);
+        drawChart("pressureChart", data.history, "pressure", "Pressure", " hPa", 1);
 
         const recent = data.history.slice(-8).reverse();
         const table = document.getElementById("recentTable");
@@ -490,6 +644,10 @@ setInterval(loadData, 10000);
 """
 
 
+# =========================
+# ROUTES
+# =========================
+
 @app.route("/")
 def home():
     return render_template_string(page)
@@ -519,6 +677,7 @@ def api_latest():
         "version": latest_data.get("version", "--"),
         "last_seen": latest_data.get("last_seen", "Never"),
         "offline": offline,
+        "update_status": pending_pico_update.get("message", "No update pending"),
         "stats": {
             "temp_min": temp_min,
             "temp_max": temp_max,
@@ -534,65 +693,119 @@ def api_latest():
 
 
 @app.route("/api/update", methods=["POST"])
+@app.route("/api/data", methods=["POST"])
 def api_update():
     global latest_data
 
-    key = request.headers.get("X-API-KEY")
+    header_key = request.headers.get("X-API-Key", "")
+    data = request.get_json(silent=True) or {}
+    json_key = data.get("key", "")
 
-    if key != API_KEY:
-        return jsonify({"error": "unauthorised"}), 401
-
-    data = request.get_json(force=True)
+    if header_key != API_KEY and json_key != API_KEY:
+        return jsonify({
+            "ok": False,
+            "message": "Bad API key"
+        }), 403
 
     timestamp = data.get("timestamp", now_string())
-    temp = safe_float(data.get("temperature"))
+    temperature = safe_float(data.get("temperature"))
     humidity = safe_float(data.get("humidity"))
     pressure = safe_float(data.get("pressure"))
-    status = data.get("status", "UNKNOWN")
+    status = data.get("status", "OK")
     version = data.get("version", "--")
 
-    prediction = data.get("prediction", "")
+    # Ignore broken NaN/null readings so the dashboard does not get poisoned.
+    if temperature is None or humidity is None or pressure is None:
+        latest_data["status"] = "SENSOR ERROR"
+        latest_data["last_seen"] = now_string()
+        latest_data["last_seen_epoch"] = time.time()
+
+        return jsonify({
+            "ok": False,
+            "message": "Invalid sensor reading ignored"
+        }), 400
 
     reading = {
         "timestamp": timestamp,
-        "temperature": temp,
+        "temperature": temperature,
         "humidity": humidity,
         "pressure": pressure,
-        "status": status,
-        "version": version,
-        "server_time": now_string()
+        "status": status
     }
 
     history.append(reading)
 
-    pressure_prediction = get_pressure_trend()
-
-    if prediction:
-        final_prediction = prediction
-    else:
-        final_prediction = pressure_prediction
-
     latest_data = {
         "timestamp": timestamp,
-        "temperature": temp,
+        "temperature": temperature,
         "humidity": humidity,
         "pressure": pressure,
         "status": status,
-        "prediction": final_prediction,
+        "prediction": get_weather_prediction(),
         "version": version,
         "last_seen": now_string(),
         "last_seen_epoch": time.time()
     }
 
-    return jsonify({"message": "data received", "latest": latest_data})
-
-
-@app.route("/api/health")
-def api_health():
     return jsonify({
-        "status": "online",
-        "history_count": len(history),
-        "last_seen": latest_data.get("last_seen", "Never")
+        "ok": True,
+        "message": "Data received",
+        "prediction": latest_data["prediction"]
+    })
+
+
+@app.route("/api/request_update", methods=["POST"])
+def request_update():
+    global pending_pico_update
+
+    data = request.get_json(silent=True) or {}
+    pin = str(data.get("pin", ""))
+
+    if pin != UPDATE_PIN:
+        return jsonify({
+            "ok": False,
+            "message": "Wrong update PIN"
+        }), 403
+
+    pending_pico_update["requested"] = True
+    pending_pico_update["requested_at"] = now_string()
+    pending_pico_update["message"] = "Pico update requested at " + now_string()
+
+    return jsonify({
+        "ok": True,
+        "message": "Update request queued. Pico will install it next time it checks in."
+    })
+
+
+@app.route("/api/command", methods=["GET"])
+def api_command():
+    global pending_pico_update
+
+    key = request.args.get("key", "")
+    device_id = request.args.get("device_id", "pico")
+
+    if key != API_KEY:
+        return jsonify({
+            "ok": False,
+            "message": "Bad API key"
+        }), 403
+
+    if pending_pico_update["requested"]:
+        pending_pico_update["requested"] = False
+        pending_pico_update["message"] = "Update command sent to Pico at " + now_string()
+
+        return jsonify({
+            "ok": True,
+            "device_id": device_id,
+            "update": True,
+            "message": "Update now"
+        })
+
+    return jsonify({
+        "ok": True,
+        "device_id": device_id,
+        "update": False,
+        "message": "No command"
     })
 
 
