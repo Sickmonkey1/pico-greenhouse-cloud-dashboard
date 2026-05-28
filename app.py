@@ -47,9 +47,12 @@ def safe_float(value):
     try:
         if value is None:
             return None
+
         value = float(value)
+
         if value != value:
             return None
+
         return value
     except:
         return None
@@ -96,8 +99,6 @@ def get_weather_prediction():
     if pressure_30 is None:
         return "Collecting weather trend"
 
-    # Local backyard-style prediction rules.
-    # These are intentionally more sensitive than normal Bureau-style forecasting.
     if pressure_30 <= -1.0 and humidity_30 is not None and humidity_30 >= 3:
         return "Pressure falling + humidity rising - rain/storm possible"
 
@@ -247,7 +248,7 @@ page = """
 
         canvas {
             width: 100%;
-            height: 220px;
+            height: 225px;
             display: block;
         }
 
@@ -301,7 +302,7 @@ page = """
             }
 
             canvas {
-                height: 200px;
+                height: 210px;
             }
         }
     </style>
@@ -448,14 +449,15 @@ function fmt(value, decimals = 1) {
 function formatTime24(timestamp) {
     if (!timestamp) return "";
 
-    let parts = String(timestamp).split(" ");
-    let timePart = parts.length > 1 ? parts[1] : parts[0];
+    let text = String(timestamp);
 
-    if (timePart.length >= 5) {
+    // Expected Pico format: YYYY-MM-DD HH:MM:SS
+    if (text.includes(" ")) {
+        let timePart = text.split(" ")[1];
         return timePart.substring(0, 5);
     }
 
-    return timePart;
+    return text.substring(0, 5);
 }
 
 function drawChart(canvasId, points, key, label, unit, decimals = 1) {
@@ -470,10 +472,10 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
 
     ctx.clearRect(0, 0, width, height);
 
-    const padLeft = 52;
-    const padRight = 12;
-    const padTop = 28;
-    const padBottom = 34;
+    const padLeft = 56;
+    const padRight = 14;
+    const padTop = 30;
+    const padBottom = 36;
 
     const plotW = width - padLeft - padRight;
     const plotH = height - padTop - padBottom;
@@ -485,6 +487,7 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
             timestamp: p.timestamp
         }));
 
+    // Background grid
     ctx.strokeStyle = "#d1d5db";
     ctx.lineWidth = 1;
 
@@ -496,6 +499,12 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
         ctx.stroke();
     }
 
+    ctx.beginPath();
+    ctx.moveTo(padLeft, padTop);
+    ctx.lineTo(padLeft, padTop + plotH);
+    ctx.lineTo(width - padRight, padTop + plotH);
+    ctx.stroke();
+
     ctx.fillStyle = "#6b7280";
     ctx.font = "11px Arial";
 
@@ -505,26 +514,42 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
     }
 
     const values = clean.map(p => p.value);
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const range = max - min || 1;
+    let min = Math.min(...values);
+    let max = Math.max(...values);
 
+    // Add small padding so line does not touch top/bottom
+    let range = max - min;
+
+    if (range === 0) {
+        range = 1;
+        min = min - 0.5;
+        max = max + 0.5;
+    } else {
+        const padding = range * 0.12;
+        min = min - padding;
+        max = max + padding;
+        range = max - min;
+    }
+
+    // Y-axis labels
     for (let i = 0; i <= 4; i++) {
         let value = max - (range / 4) * i;
         let y = padTop + (plotH / 4) * i + 4;
         ctx.fillText(value.toFixed(decimals), 6, y);
     }
 
-    const timeLabels = 4;
+    // X-axis 24-hour time labels
+    const labelCount = 4;
 
-    for (let i = 0; i <= timeLabels; i++) {
-        let index = Math.round((clean.length - 1) * (i / timeLabels));
-        let x = padLeft + (plotW * i / timeLabels);
+    for (let i = 0; i <= labelCount; i++) {
+        let index = Math.round((clean.length - 1) * (i / labelCount));
+        let x = padLeft + (plotW * i / labelCount);
         let t = formatTime24(clean[index].timestamp);
 
         ctx.fillText(t, x - 14, height - 10);
     }
 
+    // Chart line
     ctx.strokeStyle = "#2563eb";
     ctx.lineWidth = 4;
     ctx.lineCap = "round";
@@ -545,9 +570,15 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
 
     ctx.stroke();
 
+    // Title / Min Max
     ctx.fillStyle = "#111827";
     ctx.font = "13px Arial";
-    ctx.fillText(label + "  Min: " + min.toFixed(decimals) + unit + "  Max: " + max.toFixed(decimals) + unit, padLeft, 18);
+    ctx.fillText(
+        label + "  Min: " + Math.min(...values).toFixed(decimals) + unit +
+        "  Max: " + Math.max(...values).toFixed(decimals) + unit,
+        padLeft,
+        18
+    );
 }
 
 async function requestPicoUpdate() {
@@ -714,7 +745,7 @@ def api_update():
     status = data.get("status", "OK")
     version = data.get("version", "--")
 
-    # Ignore broken NaN/null readings so the dashboard does not get poisoned.
+    # Ignore bad NaN/null readings
     if temperature is None or humidity is None or pressure is None:
         latest_data["status"] = "SENSOR ERROR"
         latest_data["last_seen"] = now_string()
