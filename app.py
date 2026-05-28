@@ -1,12 +1,14 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 from datetime import datetime
 from collections import deque
 import os
-import time 
+import time
+import csv
+import io
 
 app = Flask(__name__)
 
-# ========================= 
+# =========================
 # CONFIG
 # =========================
 
@@ -14,7 +16,10 @@ API_KEY = os.environ.get("PICO_API_KEY", "change-this-key")
 UPDATE_PIN = os.environ.get("UPDATE_PIN", "1234")
 
 MAX_HISTORY = 1440
+MAX_EVENTS = 300
+
 history = deque(maxlen=MAX_HISTORY)
+event_log = deque(maxlen=MAX_EVENTS)
 
 pending_pico_update = {
     "requested": False,
@@ -85,19 +90,29 @@ def get_weather_prediction():
     if len(history) < 10:
         return "Collecting weather trend"
 
+    pressure_15 = get_change("pressure", 15)
     pressure_30 = get_change("pressure", 30)
     pressure_60 = get_change("pressure", 60)
+
+    humidity_15 = get_change("humidity", 15)
     humidity_30 = get_change("humidity", 30)
+
+    temp_15 = get_change("temperature", 15)
     temp_30 = get_change("temperature", 30)
 
     latest_pressure = latest_data.get("pressure")
     latest_humidity = latest_data.get("humidity")
+    latest_temperature = latest_data.get("temperature")
 
-    if latest_pressure is None or latest_humidity is None:
+    if latest_pressure is None or latest_humidity is None or latest_temperature is None:
         return "Collecting weather trend"
 
-    if pressure_30 is None:
+    if pressure_15 is None or pressure_30 is None:
         return "Collecting weather trend"
+
+    # Strong local storm/rain style rules
+    if pressure_15 <= -0.7 and humidity_15 is not None and humidity_15 >= 2:
+        return "Fast pressure drop + humidity rising - storm/rain possible"
 
     if pressure_30 <= -1.0 and humidity_30 is not None and humidity_30 >= 3:
         return "Pressure falling + humidity rising - rain/storm possible"
@@ -108,11 +123,19 @@ def get_weather_prediction():
     if pressure_60 is not None and pressure_60 <= -2.0:
         return "Pressure falling over the hour - rain possible"
 
+    # Clearing style rules
     if pressure_30 >= 1.0 and humidity_30 is not None and humidity_30 <= -2:
         return "Pressure rising + humidity dropping - clearing/improving"
 
+    if pressure_60 is not None and pressure_60 >= 2.0:
+        return "Pressure rising over the hour - improving conditions"
+
     if pressure_30 >= 1.5:
         return "Pressure rising - weather improving"
+
+    # Humidity / temp local rules
+    if latest_humidity >= 90 and pressure_30 <= -0.3:
+        return "Very humid with pressure falling - rain possible"
 
     if latest_humidity >= 90:
         return "Very humid - damp/rainy conditions possible"
@@ -120,10 +143,34 @@ def get_weather_prediction():
     if latest_humidity >= 85:
         return "Humidity high - moisture in the air"
 
-    if temp_30 is not None and temp_30 <= -1.0 and humidity_30 is not None and humidity_30 >= 2:
-        return "Cooling with humidity rising - rain nearby possible"
+    if temp_30 is not None and humidity_30 is not None:
+        if temp_30 <= -1.0 and humidity_30 >= 2:
+            return "Cooling with humidity rising - rain nearby possible"
+
+    if temp_15 is not None and humidity_15 is not None:
+        if temp_15 <= -0.7 and humidity_15 >= 1.5:
+            return "Quick cooling + humidity lift - weather change nearby"
 
     return "Pressure stable"
+
+
+def make_csv_response(rows, filename, fieldnames):
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for row in rows:
+        writer.writerow(row)
+
+    csv_text = output.getvalue()
+
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+    )
 
 
 # =========================
@@ -151,7 +198,7 @@ page = """
         }
 
         .container {
-            max-width: 1050px;
+            max-width: 1100px;
             margin: auto;
         }
 
@@ -262,6 +309,7 @@ page = """
             text-align: left;
             padding: 9px;
             border-bottom: 1px solid #e5e7eb;
+            vertical-align: top;
         }
 
         th {
@@ -273,16 +321,42 @@ page = """
             cursor: pointer;
         }
 
-        .update-button {
+        .button {
             width: 100%;
-            margin-top: 12px;
-            padding: 14px;
+            margin-top: 10px;
+            padding: 13px;
             border: none;
             border-radius: 18px;
             background: #111827;
             color: white;
             font-weight: 800;
-            font-size: 15px;
+            font-size: 14px;
+        }
+
+        .button.secondary {
+            background: #2563eb;
+        }
+
+        .button.rain {
+            background: #0ea5e9;
+        }
+
+        .button.storm {
+            background: #7c3aed;
+        }
+
+        .button.stop {
+            background: #16a34a;
+        }
+
+        .button.move {
+            background: #f97316;
+        }
+
+        .button-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
         }
 
         .footer {
@@ -303,6 +377,10 @@ page = """
 
             canvas {
                 height: 210px;
+            }
+
+            .button-row {
+                grid-template-columns: 1fr;
             }
         }
     </style>
@@ -393,7 +471,7 @@ page = """
                 <b id="update_status">No update pending</b>
             </div>
 
-            <button class="update-button" onclick="requestPicoUpdate()">
+            <button class="button" onclick="requestPicoUpdate()">
                 Update Pico from GitHub
             </button>
         </div>
@@ -410,9 +488,34 @@ page = """
                     <b><span id="temp_max">--</span>°C</b>
                 </div>
             </div>
+
+            <button class="button secondary" onclick="window.location.href='/download/readings.csv'">
+                Download Recent Readings CSV
+            </button>
+
+            <button class="button secondary" onclick="window.location.href='/download/events.csv'">
+                Download Event Log CSV
+            </button>
         </div>
 
         <div class="card span-8">
+            <div class="label">Rain / Storm Event Markers</div>
+            <div class="button-row">
+                <button class="button rain" onclick="logEvent('Light Rain')">Log Light Rain</button>
+                <button class="button rain" onclick="logEvent('Heavy Rain')">Log Heavy Rain</button>
+                <button class="button storm" onclick="logEvent('Thunderstorm')">Log Thunderstorm</button>
+                <button class="button stop" onclick="logEvent('Rain Stopped')">Log Rain Stopped</button>
+                <button class="button move" onclick="logEvent('Sensor Moved')">Log Sensor Moved</button>
+                <button class="button" onclick="logEvent('Other Note')">Log Other Note</button>
+            </div>
+
+            <div class="mini-box">
+                <div class="label">Last Event</div>
+                <b id="last_event">No events logged yet</b>
+            </div>
+        </div>
+
+        <div class="card span-12">
             <div class="label">Recent Readings</div>
             <table>
                 <thead>
@@ -426,6 +529,25 @@ page = """
                 </thead>
                 <tbody id="recentTable">
                     <tr><td colspan="5">Waiting for data...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card span-12">
+            <div class="label">Recent Weather Events</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Logged Time</th>
+                        <th>Event</th>
+                        <th>Note</th>
+                        <th>Temp</th>
+                        <th>Humidity</th>
+                        <th>Pressure</th>
+                    </tr>
+                </thead>
+                <tbody id="eventTable">
+                    <tr><td colspan="6">No events logged yet...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -451,7 +573,6 @@ function formatTime24(timestamp) {
 
     let text = String(timestamp);
 
-    // Expected Pico format: YYYY-MM-DD HH:MM:SS
     if (text.includes(" ")) {
         let timePart = text.split(" ")[1];
         return timePart.substring(0, 5);
@@ -487,7 +608,6 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
             timestamp: p.timestamp
         }));
 
-    // Background grid
     ctx.strokeStyle = "#d1d5db";
     ctx.lineWidth = 1;
 
@@ -517,7 +637,6 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
     let min = Math.min(...values);
     let max = Math.max(...values);
 
-    // Add small padding so line does not touch top/bottom
     let range = max - min;
 
     if (range === 0) {
@@ -531,14 +650,12 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
         range = max - min;
     }
 
-    // Y-axis labels
     for (let i = 0; i <= 4; i++) {
         let value = max - (range / 4) * i;
         let y = padTop + (plotH / 4) * i + 4;
         ctx.fillText(value.toFixed(decimals), 6, y);
     }
 
-    // X-axis 24-hour time labels
     const labelCount = 4;
 
     for (let i = 0; i <= labelCount; i++) {
@@ -549,7 +666,6 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
         ctx.fillText(t, x - 14, height - 10);
     }
 
-    // Chart line
     ctx.strokeStyle = "#2563eb";
     ctx.lineWidth = 4;
     ctx.lineCap = "round";
@@ -570,7 +686,6 @@ function drawChart(canvasId, points, key, label, unit, decimals = 1) {
 
     ctx.stroke();
 
-    // Title / Min Max
     ctx.fillStyle = "#111827";
     ctx.font = "13px Arial";
     ctx.fillText(
@@ -606,6 +721,34 @@ async function requestPicoUpdate() {
     }
 }
 
+async function logEvent(eventType) {
+    let note = prompt("Add a note for: " + eventType);
+
+    if (note === null) {
+        return;
+    }
+
+    try {
+        const response = await fetch("/api/event", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                event_type: eventType,
+                note: note
+            })
+        });
+
+        const data = await response.json();
+        alert(data.message);
+        loadData();
+
+    } catch (error) {
+        alert("Event log failed");
+    }
+}
+
 async function loadData() {
     try {
         const response = await fetch("/api/latest");
@@ -638,11 +781,13 @@ async function loadData() {
             statusEl.classList.add("warning");
         }
 
-        drawChart("tempChart", data.history, "temperature", "Temperature", "°C", 1);
-        drawChart("humChart", data.history, "humidity", "Humidity", "%", 1);
-        drawChart("pressureChart", data.history, "pressure", "Pressure", " hPa", 1);
+        const history = Array.isArray(data.history) ? data.history : [];
 
-        const recent = data.history.slice(-8).reverse();
+        drawChart("tempChart", history, "temperature", "Temperature", "°C", 1);
+        drawChart("humChart", history, "humidity", "Humidity", "%", 1);
+        drawChart("pressureChart", history, "pressure", "Pressure", " hPa", 1);
+
+        const recent = history.slice(-8).reverse();
         const table = document.getElementById("recentTable");
 
         if (recent.length === 0) {
@@ -659,9 +804,34 @@ async function loadData() {
             `).join("");
         }
 
+        const events = Array.isArray(data.events) ? data.events : [];
+        const eventTable = document.getElementById("eventTable");
+
+        if (events.length === 0) {
+            eventTable.innerHTML = '<tr><td colspan="6">No events logged yet...</td></tr>';
+            document.getElementById("last_event").innerHTML = "No events logged yet";
+        } else {
+            const lastEvent = events[events.length - 1];
+            document.getElementById("last_event").innerHTML =
+                lastEvent.logged_time + " — " + lastEvent.event_type;
+
+            eventTable.innerHTML = events.slice(-8).reverse().map(row => `
+                <tr>
+                    <td>${row.logged_time}</td>
+                    <td>${row.event_type}</td>
+                    <td>${row.note}</td>
+                    <td>${fmt(row.temperature)}°C</td>
+                    <td>${fmt(row.humidity)}%</td>
+                    <td>${fmt(row.pressure)} hPa</td>
+                </tr>
+            `).join("");
+        }
+
     } catch (error) {
+        console.log("Dashboard refresh error:", error);
+
         const statusEl = document.getElementById("status");
-        statusEl.innerHTML = "OFFLINE";
+        statusEl.innerHTML = "DASHBOARD ERROR";
         statusEl.className = "status-pill offline";
     }
 }
@@ -695,7 +865,7 @@ def api_latest():
 
     if last_seen_epoch == 0:
         offline = True
-    elif time.time() - last_seen_epoch > 180:
+    elif time.time() - last_seen_epoch > 600:
         offline = True
 
     data = {
@@ -717,7 +887,8 @@ def api_latest():
             "pressure_min": pressure_min,
             "pressure_max": pressure_max
         },
-        "history": list(history)
+        "history": list(history),
+        "events": list(event_log)
     }
 
     return jsonify(data)
@@ -745,7 +916,6 @@ def api_update():
     status = data.get("status", "OK")
     version = data.get("version", "--")
 
-    # Ignore bad NaN/null readings
     if temperature is None or humidity is None or pressure is None:
         latest_data["status"] = "SENSOR ERROR"
         latest_data["last_seen"] = now_string()
@@ -783,6 +953,76 @@ def api_update():
         "message": "Data received",
         "prediction": latest_data["prediction"]
     })
+
+
+@app.route("/api/event", methods=["POST"])
+def api_event():
+    data = request.get_json(silent=True) or {}
+
+    event_type = str(data.get("event_type", "Other Note"))
+    note = str(data.get("note", ""))
+
+    event = {
+        "logged_time": now_string(),
+        "event_type": event_type,
+        "note": note,
+        "station_timestamp": latest_data.get("timestamp", "No data yet"),
+        "temperature": latest_data.get("temperature"),
+        "humidity": latest_data.get("humidity"),
+        "pressure": latest_data.get("pressure"),
+        "status": latest_data.get("status"),
+        "prediction": latest_data.get("prediction")
+    }
+
+    event_log.append(event)
+
+    return jsonify({
+        "ok": True,
+        "message": "Event logged: " + event_type,
+        "event": event
+    })
+
+
+@app.route("/download/readings.csv")
+def download_readings():
+    rows = list(history)
+
+    fieldnames = [
+        "timestamp",
+        "temperature",
+        "humidity",
+        "pressure",
+        "status"
+    ]
+
+    return make_csv_response(
+        rows,
+        "greenhouse_recent_readings.csv",
+        fieldnames
+    )
+
+
+@app.route("/download/events.csv")
+def download_events():
+    rows = list(event_log)
+
+    fieldnames = [
+        "logged_time",
+        "event_type",
+        "note",
+        "station_timestamp",
+        "temperature",
+        "humidity",
+        "pressure",
+        "status",
+        "prediction"
+    ]
+
+    return make_csv_response(
+        rows,
+        "greenhouse_event_log.csv",
+        fieldnames
+    )
 
 
 @app.route("/api/request_update", methods=["POST"])
