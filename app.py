@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string, Response
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import deque
 import os
 import time
@@ -14,6 +15,7 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("PICO_API_KEY", "change-this-key")
 UPDATE_PIN = os.environ.get("UPDATE_PIN", "1234")
+LOCAL_TZ = ZoneInfo("Australia/Brisbane")
 
 MAX_HISTORY = 1440
 MAX_EVENTS = 300
@@ -45,7 +47,7 @@ latest_data = {
 # =========================
 
 def now_string():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"))
 
 
 def safe_float(value):
