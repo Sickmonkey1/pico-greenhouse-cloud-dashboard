@@ -47,7 +47,7 @@ latest_data = {
 # =========================
 
 def now_string():
-    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"))
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def safe_float(value):
